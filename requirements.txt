@@ -1,2 +1,5 @@
+# Pinned exactly: the SDK's v2 line is still a pre-release and the API is
+# moving. Anything that depends on `mcp` in production should instead pin an
+# upper bound (`mcp>=1.27,<2`) so the eventual stable v2 doesn't surprise it.
 mcp[cli]==2.0.0rc1
-uvicorn
+uvicorn==0.52.0

@@ -1,6 +1,14 @@
-
 __pycache__/
-.claude
-venv
+*.py[cod]
 
+venv/
+.venv/
+
+.env
+*.log
+
+.claude/
+.DS_Store
+
+# Client material — never publish.
 JD.md
