@@ -3,3 +3,12 @@
 # upper bound (`mcp>=1.27,<2`) so the eventual stable v2 doesn't surprise it.
 mcp[cli]==2.0.0rc1
 uvicorn==0.52.0
+
+# Token verification. Both arrive transitively via `mcp`, but the governance
+# layer imports them directly, so they are declared directly — a transitive
+# dependency that a later SDK release drops is an import error at startup.
+PyJWT==2.13.0
+cryptography==49.0.0
+
+# The authorization policy document.
+PyYAML==6.0.3

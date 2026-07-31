@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# The suite uses anyio's runner (already a dependency of `mcp`) rather than an
+# asyncio plugin, so pytest alone is enough.
+pytest==9.1.1

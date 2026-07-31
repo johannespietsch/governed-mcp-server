@@ -20,12 +20,40 @@ something concretely shaped to wrap; they are not a data source.
     python server.py --port 8000
 """
 
+from __future__ import annotations
+
+import os
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from mcp.server import MCPServer
+from mcp.server.auth.settings import AuthSettings
 from pydantic import BaseModel, Field
 
-mcp = MCPServer("Governed MCP Server")
+from governance import (
+    audit,
+    EntraTokenVerifier,
+    JwksEndpoint,
+    Policy,
+    PolicyEnforcementMiddleware,
+    StaticJwks,
+    entra_issuer,
+    entra_jwks_uri,
+)
+from governance.devidp import DEV_KEY_PATH, DevIdentityProvider
+
+AuthMode = Literal["off", "dev", "entra"]
+
+# The audience this server accepts tokens for. In Entra this is the Application
+# ID URI of the app registration that represents *this* API. A token minted for
+# anything else is rejected — see governance/verifier.py.
+DEFAULT_AUDIENCE = "api://governed-mcp-server"
+DEFAULT_RESOURCE_URL = "http://127.0.0.1:8000/mcp"
+
+# Coarse gate at the transport layer: may this caller talk to the server at
+# all. Which *tools* they may then invoke is decided by policy.yaml, so there
+# is exactly one place to look when answering "why was this allowed".
+REQUIRED_SCOPES = ["mcp.invoke"]
 
 
 class Shipment(BaseModel):
@@ -78,7 +106,6 @@ def _fixtures() -> dict[str, Shipment]:
 SHIPMENTS = _fixtures()
 
 
-@mcp.tool()
 def get_shipment_status(shipment_id: str) -> ShipmentStatus:
     """Look up the current status and estimated arrival of a single shipment."""
     shipment = SHIPMENTS.get(shipment_id)
@@ -94,7 +121,6 @@ def get_shipment_status(shipment_id: str) -> ShipmentStatus:
     )
 
 
-@mcp.tool()
 def list_delayed_shipments(threshold_hours: int = 24) -> list[DelayedShipment]:
     """List undelivered shipments arriving later than `threshold_hours` from now."""
     cutoff = datetime.now(timezone.utc) + timedelta(hours=threshold_hours)
@@ -110,7 +136,6 @@ def list_delayed_shipments(threshold_hours: int = 24) -> list[DelayedShipment]:
     ]
 
 
-@mcp.resource("shipment://{shipment_id}")
 def shipment_detail(shipment_id: str) -> str:
     """Human-readable summary of a shipment, addressable as a resource."""
     shipment = SHIPMENTS.get(shipment_id)
@@ -122,18 +147,139 @@ def shipment_detail(shipment_id: str) -> str:
     )
 
 
+def create_server(
+    *,
+    auth_mode: AuthMode = "off",
+    policy_path: str | None = "policy.yaml",
+    dev_idp: DevIdentityProvider | None = None,
+    resource_url: str = DEFAULT_RESOURCE_URL,
+    audience: str = DEFAULT_AUDIENCE,
+    enforce: bool = True,
+) -> MCPServer:
+    """Build the server with a given authorization posture.
+
+    `auth_mode` is the only thing that differs between running this on a laptop
+    and running it against a tenant:
+
+      off    no token required, no policy — the stage-0 transport demo
+      dev    tokens from the in-process development identity provider
+      entra  tokens from a real Entra tenant, configured through the
+             environment (MCP_ENTRA_TENANT_ID, MCP_RESOURCE_AUDIENCE)
+
+    `dev` and `entra` differ only in where signing keys are fetched from. The
+    verifier, the policy and the enforcement path are identical, so the tests
+    that run against `dev` are exercising the code that runs in production.
+    """
+    verifier = None
+    auth_settings = None
+
+    if auth_mode == "dev":
+        idp = dev_idp or DevIdentityProvider(audience=audience)
+        verifier = EntraTokenVerifier(
+            issuer=idp.issuer,
+            audience=idp.audience,
+            key_source=StaticJwks(idp.jwks()),
+        )
+        auth_settings = AuthSettings(
+            issuer_url=idp.issuer,  # type: ignore[arg-type]
+            resource_server_url=resource_url,  # type: ignore[arg-type]
+            required_scopes=REQUIRED_SCOPES,
+        )
+    elif auth_mode == "entra":
+        tenant_id = os.environ.get("MCP_ENTRA_TENANT_ID")
+        if not tenant_id:
+            raise SystemExit("auth mode 'entra' requires MCP_ENTRA_TENANT_ID to be set")
+        audience = os.environ.get("MCP_RESOURCE_AUDIENCE", audience)
+        verifier = EntraTokenVerifier(
+            issuer=entra_issuer(tenant_id),
+            audience=audience,
+            key_source=JwksEndpoint(entra_jwks_uri(tenant_id)),
+        )
+        auth_settings = AuthSettings(
+            issuer_url=entra_issuer(tenant_id),  # type: ignore[arg-type]
+            resource_server_url=os.environ.get("MCP_RESOURCE_URL", resource_url),  # type: ignore[arg-type]
+            required_scopes=REQUIRED_SCOPES,
+        )
+
+    server = MCPServer(
+        "Governed MCP Server",
+        token_verifier=verifier,
+        auth=auth_settings,
+    )
+
+    server.tool()(get_shipment_status)
+    server.tool()(list_delayed_shipments)
+    server.resource("shipment://{shipment_id}")(shipment_detail)
+
+    if auth_mode != "off" and policy_path is not None:
+        policy = Policy.load(policy_path)
+        # `Server.middleware` is the documented context-tier extension point:
+        # it wraps every inbound request before validation or dispatch, which
+        # is what lets authorization be applied uniformly instead of per tool.
+        # Appending puts it innermost, so the SDK's OpenTelemetry middleware
+        # still traces the requests this one rejects.
+        server._lowlevel_server.middleware.append(  # noqa: SLF001 - no public accessor yet
+            PolicyEnforcementMiddleware(policy, enforce=enforce)
+        )
+
+    return server
+
+
+# Module-level instance for the unauthenticated transport demo, and for
+# `client.py` running in-memory. The governed path is `--auth dev`.
+mcp = create_server(auth_mode="off")
+
+
 if __name__ == "__main__":
     import argparse
+    import logging
 
     import uvicorn
 
     parser = argparse.ArgumentParser(description="Run the MCP server over Streamable HTTP.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--auth",
+        choices=["off", "dev", "entra"],
+        default="off",
+        help="authorization mode (default: off, the transport-only demo)",
+    )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help="audit policy decisions without enforcing them, to trial a policy against real traffic",
+    )
+    parser.add_argument("--print-token", metavar="ROLE", nargs="*",
+                        help="with --auth dev, print a token carrying these roles and exit")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
+    audit.configure()
+
+    # Persisted so that `--print-token` in a second terminal signs with the same
+    # key the running server verifies against.
+    idp = (
+        DevIdentityProvider(audience=DEFAULT_AUDIENCE, key_path=DEV_KEY_PATH)
+        if args.auth == "dev"
+        else None
+    )
+
+    if args.print_token is not None:
+        if idp is None:
+            raise SystemExit("--print-token requires --auth dev")
+        print(idp.issue(roles=list(args.print_token)))
+        raise SystemExit(0)
+
+    app = create_server(
+        auth_mode=args.auth,
+        dev_idp=idp,
+        resource_url=f"http://{args.host}:{args.port}/mcp",
+        enforce=not args.shadow,
+    )
 
     # streamable_http_app() is the ASGI (Asynchronous Server Gateway Interface)
     # app — this is what sits behind Azure API Management, nginx or any ordinary
     # load balancer in a real deployment. Run it on two ports and round-robin
     # between them to watch the statelessness claim hold.
-    uvicorn.run(mcp.streamable_http_app(), host=args.host, port=args.port)
+    uvicorn.run(app.streamable_http_app(), host=args.host, port=args.port)
