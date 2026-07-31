@@ -1,0 +1,11 @@
+governed-mcp-server
+Copyright 2026 Johannes Pietsch
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+This is an independent reference implementation, published for demonstration
+and evaluation. It is not affiliated with, endorsed by, or derived from the
+systems, configurations, credentials or internal material of any employer or
+client. All transport and logistics data it contains is synthetic and
+generated at runtime.

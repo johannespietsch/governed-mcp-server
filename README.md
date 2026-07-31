@@ -207,6 +207,12 @@ rather than by implementation order.
    confused deputy), runbooks for secret rotation and connector revocation,
    and a guide for onboarding the second domain.
 
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Apache
+rather than MIT for the explicit patent grant, since this is meant to be
+readable and reusable inside an enterprise.
+
 ## Notes on the SDK
 
 `mcp[cli]==2.0.0rc1` is pinned exactly — the v2 line isn't stable yet, so pin
