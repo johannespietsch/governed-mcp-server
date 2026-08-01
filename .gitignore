@@ -12,3 +12,6 @@ venv/
 
 # Client material — never publish.
 JD.md
+
+# Development identity provider signing key (--auth dev). Local only.
+.devidp-key.pem

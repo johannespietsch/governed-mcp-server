@@ -11,10 +11,13 @@ it — who may call which tool, against which system, with what recorded
 afterwards. This repository builds that out in tranches, on top of a stateless
 `2026-07-28` server.
 
-**Status: stage 0 — transport baseline.** The server and client below run and
-are tested, in-memory and over real HTTP. Everything under
-[Roadmap](#roadmap) is designed but not yet implemented, and is marked as
-such. Nothing here has been deployed against a live Azure tenant.
+**Status: tranche 1 — identity and authorization, implemented and tested.**
+Token verification and declarative per-tool access control run and are covered
+by 31 tests, in-memory and over real HTTP. Tranches 2–6 under
+[Roadmap](#roadmap) are designed but not yet implemented, and are marked as
+such. Nothing here has been deployed against a live Azure tenant — the
+authorization path is exercised against a local identity provider that mints
+Entra-shaped tokens (see [Authorization](#authorization)).
 
 ## Why stateless first
 
@@ -45,8 +48,9 @@ flowchart LR
     S --> O[Audit log + OpenTelemetry<br/>Azure Monitor]
 ```
 
-Real today: the stateless server replicas and their transport. Everything else
-is target state.
+Real today: the stateless server replicas, their transport, token verification
+against the identity provider, and the policy engine. Key Vault, the connector
+layer, API Management and the Azure Monitor export are target state.
 
 ## Setup
 
@@ -54,6 +58,9 @@ is target state.
 python3 -m venv venv
 source venv/bin/activate        # venv\Scripts\activate on Windows
 pip install -r requirements.txt
+
+pip install -r requirements-dev.txt   # to run the tests
+python -m pytest -q
 ```
 
 ## Files
@@ -61,7 +68,18 @@ pip install -r requirements.txt
 - **`server.py`** — the MCP server. Two tools (`get_shipment_status`,
   `list_delayed_shipments`) and one resource template (`shipment://{id}`),
   built with `MCPServer` (the v2 rename of `FastMCP` — same decorator API
-  you'd already recognize).
+  you'd already recognize). `create_server(auth_mode=...)` selects the
+  authorization posture.
+- **`policy.yaml`** — who may call what. The whole access-control model, as a
+  reviewable document.
+- **`governance/`** — the layers wrapped around the server:
+  - `verifier.py` — Entra ID token validation, implementing the SDK's
+    `TokenVerifier` protocol
+  - `policy.py` — the policy document and the decisions it yields
+  - `middleware.py` — enforcement, applied uniformly to every request
+  - `audit.py` — the authorization decision trail
+  - `devidp.py` — a local identity provider, so all of the above is testable
+    with no Azure tenant
 - **`client.py`** — exercises the server along two independent axes,
   transport and protocol era:
   - `python client.py` — in-memory, no transport at all (fastest way to test)
@@ -96,6 +114,132 @@ list_delayed_shipments(24) -> [{'id': 'SHP-1002', ...}, {'id': 'SHP-1004', ...}]
 shipment detail -> SHP-1004: Zeebrugge -> Koln, status delayed, ...
 protocol version negotiated: 2026-07-28
 ```
+
+## Authorization
+
+Three postures, selected with `--auth`:
+
+| Mode | Tokens | Use |
+| --- | --- | --- |
+| `off` (default) | none required | the transport demo above |
+| `dev` | in-process identity provider | development and the test suite |
+| `entra` | a real Entra tenant | configured via environment variables |
+
+`dev` and `entra` differ **only in where signing keys are fetched from** — a
+static JWKS versus the tenant's JWKS endpoint. The verifier, the policy and the
+enforcement path are identical, so the tests exercise the code that runs in
+production, and moving to a tenant is configuration rather than a rewrite.
+
+### Try it
+
+```bash
+python server.py --auth dev --port 8000 &
+
+# Mint tokens. The signing key is persisted to .devidp-key.pem so a second
+# process signs with the key the running server verifies against.
+READER=$(python server.py --auth dev --print-token tlo.reader)
+NOROLE=$(python server.py --auth dev --print-token)
+```
+
+No token — a challenge pointing at the metadata document, per RFC 9728:
+
+```
+$ curl -i -X POST localhost:8000/mcp -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer error="invalid_token", error_description="Authentication
+  required", resource_metadata="http://127.0.0.1:8000/.well-known/oauth-protected-resource/mcp"
+```
+
+With `$READER`, the call succeeds. With `$NOROLE` the token is *valid* — it
+just carries no role that grants the tool:
+
+```
+tools visible: []                       # discovery is filtered to the caller
+MCPError -32003 Access denied for 'get_shipment_status': caller holds none of
+                the roles this tool requires
+```
+
+### What is actually enforced
+
+**Token validation** (`governance/verifier.py`). Signature against the issuer's
+published keys, then three checks that decide whether this is a real gate or
+decoration:
+
+- **Audience, exactly.** The token must name *this* server. This is the
+  confused-deputy defence: a token a user legitimately holds for another
+  service must not be replayable here, and a token this server receives must
+  not be forwardable upstream. It is the most commonly skipped check in MCP
+  deployments, and the reason token passthrough is called out as an
+  anti-pattern in the specification.
+- **Asymmetric algorithms only.** Permitting an HMAC algorithm lets a caller
+  sign their own tokens using the *public* key as the shared secret — the
+  algorithm-confusion attack. `alg: none` is rejected for the same reason. The
+  constructor refuses an unsafe algorithm rather than trusting the caller to
+  pass a safe list.
+- **Expiry, issuer, and required claims**, with a small clock-skew allowance.
+
+**Per-tool access control** (`policy.yaml`, `governance/policy.py`). Entra app
+roles arrive in the token's `roles` claim and are matched against a declarative
+document — data, not code, so it can be reviewed by people who do not read
+Python, diffed in a change request, and pointed at during an audit. Two
+properties are deliberate:
+
+- **Fail closed.** A tool with no policy entry is denied. Shipping a tool
+  without an authorization decision makes it unreachable, which is a visible
+  bug, rather than public, which is a silent one.
+- **Fail fast.** Every role a rule references must be declared. A typo in a
+  role name stops the server from starting, instead of producing a rule that
+  can never match — and a rule that never matches is invisible in testing and
+  looks exactly like a working deny.
+
+**Enforcement** (`governance/middleware.py`) is server middleware, so it sees
+every request before dispatch and applies to every tool uniformly. There is no
+per-tool decorator for an author to forget. Denials are raised before the
+handler runs, so an unauthorized call never reaches a downstream system.
+`tools/list` is filtered to what the caller may actually invoke — listing a
+tool someone cannot call leaks the shape of systems they have no access to,
+and invites an agent to plan around a call that will always be refused.
+
+**Two tiers, one decision point.** Scopes gate whether a caller may reach the
+server at all, at the transport layer. Roles gate which tools they may then
+invoke, in the policy. Authorization decisions live in exactly one place, which
+is what makes "why was this allowed" answerable.
+
+**Audit** (`governance/audit.py`) records every decision as a JSON line —
+principal, target, outcome, reason, classification, roles required and held.
+It is deliberately a separate stream from application logging, with its own
+handler and no propagation to the root logger: they have different readers,
+retention and access rules, and the SDK's `rich` handler wraps long lines,
+which silently corrupts anything meant to be parsed later.
+
+```json
+{"timestamp":"2026-07-31T19:58:22Z","principal":"user@example.com","method":"tools/call",
+ "target":"get_shipment_status","outcome":"deny","reason":"caller holds none of the roles
+ this tool requires","classification":"internal","required_roles":["tlo.operator",
+ "tlo.reader"],"granted_roles":[],"argument_names":["shipment_id"]}
+```
+
+Argument *values* are not recorded. Shipment identifiers are low risk, but the
+same path will carry incident bodies and customer references once the
+connectors land, and a log that quietly became confidential-tier is worse than
+one that never held the data.
+
+**Shadow mode.** `--shadow` audits decisions without enforcing them, so a
+policy can be trialled against real traffic and the calls it would break found
+before it starts breaking them.
+
+### Against a real tenant
+
+```bash
+export MCP_ENTRA_TENANT_ID=<tenant-guid>
+export MCP_RESOURCE_AUDIENCE=api://governed-mcp-server   # the app registration's ID URI
+python server.py --auth entra
+```
+
+Roles come from app roles defined on that app registration and assigned to
+users or service principals. Signing keys are fetched from the tenant's JWKS
+endpoint and cached by key id, so key rollover needs no restart. This path is
+implemented but has not been run against a live tenant.
 
 ## Old clients
 
@@ -168,15 +312,15 @@ configuration moved onto `uvicorn.run(..., port=...)`, which is what the
 Ordered by how much each tranche says about running MCP in an enterprise,
 rather than by implementation order.
 
-1. **Identity and authorization.** Turn the server into an OAuth 2.1 protected
-   resource against Entra ID: protected-resource metadata, `WWW-Authenticate`
-   challenge, JSON Web Key Set (JWKS) validation through a custom
-   `TokenVerifier`. Strict audience validation against the server's own
-   resource URI — the confused-deputy and token-passthrough defence. Entra app
-   roles mapped to **declarative per-tool RBAC** in a policy file, not
-   conditionals. The SDK also exposes `identity_assertion_enabled` (SEP-990
-   ID-JAG, the RFC 7523 jwt-bearer grant) for enterprise identity provider
-   flows, which is the right primitive here.
+1. ~~**Identity and authorization.**~~ **Done** — see
+   [Authorization](#authorization). Protected-resource metadata,
+   `WWW-Authenticate` challenge, JWKS validation through a custom
+   `TokenVerifier`, strict audience validation, and declarative per-tool RBAC
+   with an audit record per decision.
+   Still outstanding here: the SDK exposes `identity_assertion_enabled`
+   (SEP-990 ID-JAG, the RFC 7523 jwt-bearer grant) for enterprise identity
+   provider flows, which is the right primitive for on-behalf-of chains and is
+   not yet wired up.
 2. **Connector architecture.** A connector base with declarative manifests —
    authentication mode, Key Vault secret reference, rate limit, retry and
    circuit breaker, data classification — with tools generated from manifests

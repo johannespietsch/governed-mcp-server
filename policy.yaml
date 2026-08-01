@@ -1,0 +1,62 @@
+# Authorization policy for the MCP layer.
+#
+# This file is the single place where "who may call what" is decided. It is
+# deliberately data rather than code: it can be reviewed by people who do not
+# read Python, diffed in a change request, and pointed at during an audit.
+#
+# Roles are Microsoft Entra ID *app roles*, which arrive in the `roles` claim of
+# the access token. Nothing here is derived from the token's scopes — scopes
+# gate whether a caller may reach this server at all (see `required_scopes` in
+# server.py); roles gate which tools they may then invoke.
+
+version: 1
+
+# Fail closed. A tool with no entry under `tools:` is denied, so shipping a new
+# tool without a policy decision makes it unreachable rather than public.
+default: deny
+
+# Every role a rule references must be declared here. The policy fails to load
+# otherwise, which turns a typo in a role name into a startup error instead of
+# an authorization hole discovered in production.
+roles:
+  tlo.reader:
+    description: >-
+      Read-only visibility into transport and logistics operations. The default
+      role for dashboards, reporting and support staff.
+  tlo.operator:
+    description: >-
+      Everything a reader may do, plus actions that change state in a
+      downstream system. Granted to the operations team.
+  platform.admin:
+    description: >-
+      Break-glass access for the platform team. Intended to be assigned
+      temporarily and reviewed on every access recertification.
+
+# Data classification is recorded per tool so that audit and, later, redaction
+# can be driven from the same declaration as authorization. Tiers, lowest to
+# highest: public, internal, confidential, restricted.
+tools:
+  get_shipment_status:
+    classification: internal
+    description: Point lookup of a single shipment.
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
+
+  list_delayed_shipments:
+    classification: internal
+    description: Bulk view of shipments at risk.
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
+
+# Resource URIs match by glob, most specific pattern first.
+resources:
+  "shipment://*":
+    classification: internal
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
