@@ -52,6 +52,51 @@ tools:
       - tlo.operator
       - platform.admin
 
+  # -- ServiceNow domain ---------------------------------------------------
+
+  search_incidents:
+    classification: internal
+    description: Read open incidents from ServiceNow.
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
+
+  get_configuration_item:
+    classification: internal
+    description: Look up a configuration item in the CMDB.
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
+
+  assess_shipment_delay:
+    classification: internal
+    description: >-
+      Lighthouse use case, read-only half. Correlates a delayed shipment to its
+      handling system and any incidents already open against it.
+    allow_roles:
+      - tlo.reader
+      - tlo.operator
+      - platform.admin
+
+  raise_shipment_incident:
+    classification: confidential
+    description: >-
+      Lighthouse use case, write half. Opens an incident in ServiceNow, which
+      pages a rota and is visible to the customer-facing service desk — hence a
+      higher classification than the read tools and a narrower grant.
+    allow_roles:
+      - tlo.operator
+      - platform.admin
+    # Authorization says this caller *may* raise incidents. Approval says a
+    # human agreed to this one. The gate is enforced by the middleware, so no
+    # tool has to remember to implement it.
+    requires_approval: true
+    approval_prompt: >-
+      This will open a ServiceNow incident against a production configuration
+      item and notify the on-call rota. Approve?
+
 # Resource URIs match by glob, most specific pattern first.
 resources:
   "shipment://*":

@@ -43,6 +43,11 @@ class Decision:
     classification: str | None = None
     required_roles: tuple[str, ...] = ()
     granted_roles: tuple[str, ...] = ()
+    # Authorization says the caller *may* do this. Approval says a human has
+    # agreed to this particular instance of it. They are different questions,
+    # so a tool can require both, and both are declared in the same document.
+    requires_approval: bool = False
+    approval_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,8 @@ class Rule:
     allow_roles: frozenset[str]
     classification: str
     description: str = ""
+    requires_approval: bool = False
+    approval_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -146,6 +153,8 @@ class Policy:
                 allow_roles=frozenset(allow_roles),
                 classification=classification,
                 description=str(body.get("description", "")),
+                requires_approval=bool(body.get("requires_approval", False)),
+                approval_prompt=str(body.get("approval_prompt", "")),
             )
         return rules
 
@@ -186,22 +195,16 @@ class Policy:
     @staticmethod
     def _match(rule: Rule, target: str, granted: tuple[str, ...]) -> Decision:
         required = tuple(sorted(rule.allow_roles))
-        if set(granted) & rule.allow_roles:
-            return Decision(
-                allowed=True,
-                reason="granted by role",
-                target=target,
-                classification=rule.classification,
-                required_roles=required,
-                granted_roles=granted,
-            )
+        allowed = bool(set(granted) & rule.allow_roles)
         return Decision(
-            allowed=False,
-            reason="caller holds none of the roles this tool requires",
+            allowed=allowed,
+            reason="granted by role" if allowed else "caller holds none of the roles this tool requires",
             target=target,
             classification=rule.classification,
             required_roles=required,
             granted_roles=granted,
+            requires_approval=rule.requires_approval,
+            approval_prompt=rule.approval_prompt,
         )
 
     def visible_tools(self, roles: Iterable[str]) -> set[str]:

@@ -56,14 +56,21 @@ def record(
     decision: Decision,
     arguments: dict | None = None,
     protocol_version: str | None = None,
+    outcome: str | None = None,
 ) -> None:
-    """Emit one authorization decision as a structured record."""
+    """Emit one authorization decision as a structured record.
+
+    `outcome` overrides the allow/deny derived from `decision`. It exists for
+    the one case that is neither: an approval that has been *requested* and is
+    waiting on a human. Recording that as a denial would count every gated call
+    twice and make the denial rate meaningless to whoever is watching it.
+    """
     event = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "principal": principal,
         "method": method,
         "target": decision.target,
-        "outcome": "allow" if decision.allowed else "deny",
+        "outcome": outcome or ("allow" if decision.allowed else "deny"),
         "reason": decision.reason,
         "classification": decision.classification,
         "required_roles": list(decision.required_roles),
@@ -76,6 +83,7 @@ def record(
             event["arguments"] = arguments
 
     # Denials are the security-relevant events and should survive a log level
-    # set to WARNING in production; allows are the volume and can be dropped.
-    log = audit_logger.warning if not decision.allowed else audit_logger.info
+    # set to WARNING in production; allows and pending gates are the volume and
+    # can be dropped.
+    log = audit_logger.warning if event["outcome"] == "deny" else audit_logger.info
     log(json.dumps(event, separators=(",", ":"), default=str))

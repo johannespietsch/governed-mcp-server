@@ -11,13 +11,14 @@ it — who may call which tool, against which system, with what recorded
 afterwards. This repository builds that out in tranches, on top of a stateless
 `2026-07-28` server.
 
-**Status: tranche 1 — identity and authorization, implemented and tested.**
-Token verification and declarative per-tool access control run and are covered
-by 31 tests, in-memory and over real HTTP. Tranches 2–6 under
-[Roadmap](#roadmap) are designed but not yet implemented, and are marked as
-such. Nothing here has been deployed against a live Azure tenant — the
-authorization path is exercised against a local identity provider that mints
-Entra-shaped tokens (see [Authorization](#authorization)).
+**Status: tranches 1 and 3 implemented and tested** — identity and
+authorization, and the ServiceNow domain with its lighthouse use case. 46 tests,
+in-memory and over real HTTP. Tranches 2, 4, 5 and 6 under [Roadmap](#roadmap)
+are designed but not yet implemented, and are marked as such.
+
+Nothing here has been deployed against a live Azure tenant, and the ServiceNow
+connector runs against an in-process mock by default — so the repository has no
+credentials in it and needs none to run.
 
 ## Why stateless first
 
@@ -70,14 +71,16 @@ python -m pytest -q
   built with `MCPServer` (the v2 rename of `FastMCP` — same decorator API
   you'd already recognize). `create_server(auth_mode=...)` selects the
   authorization posture.
-- **`policy.yaml`** — who may call what. The whole access-control model, as a
-  reviewable document.
+- **`policy.yaml`** — who may call what, and what needs a human. The whole
+  access-control model, as a reviewable document.
 - **`governance/`** — the layers wrapped around the server:
   - `verifier.py` — Entra ID token validation, implementing the SDK's
     `TokenVerifier` protocol
   - `policy.py` — the policy document and the decisions it yields
   - `middleware.py` — enforcement, applied uniformly to every request
+  - `approval.py` — the human-in-the-loop gate
   - `audit.py` — the authorization decision trail
+  - `servicenow.py` — the ITSM connector, live or mocked
   - `devidp.py` — a local identity provider, so all of the above is testable
     with no Azure tenant
 - **`client.py`** — exercises the server along two independent axes,
@@ -228,6 +231,85 @@ one that never held the data.
 policy can be trialled against real traffic and the calls it would break found
 before it starts breaking them.
 
+## The lighthouse use case
+
+Transport and Logistics Operations, split into a read half and a write half
+because they warrant different privileges:
+
+| Tool | Roles | Classification | Human approval |
+| --- | --- | --- | --- |
+| `assess_shipment_delay` | reader, operator, admin | internal | no |
+| `search_incidents`, `get_configuration_item` | reader, operator, admin | internal | no |
+| `raise_shipment_incident` | operator, admin | confidential | **yes** |
+
+`assess_shipment_delay` correlates a late shipment to the configuration item
+that handles it and to any incident already open against that item, then
+recommends an action. It changes nothing. That separation matters in an agent
+loop: an assessment that quietly opened tickets would mean an agent could not
+look without also touching production.
+
+The whole flow, over HTTP, against the mock ServiceNow:
+
+```
+1. reader assess       -> Raise a new incident against CI-TMS-02.
+2. reader raise        -> DENIED: caller holds none of the roles this tool requires
+3. operator, declined  -> BLOCKED: not approved: a human declined the action
+4. operator, approved  -> INC0020001  CI-TMS-02
+5. re-assess           -> Enrich INC0020001 rather than opening a duplicate.
+```
+
+### The approval gate
+
+`raise_shipment_incident` contains no approval code. The policy marks it
+`requires_approval` and the middleware holds the call, so the gate cannot be
+forgotten by a tool author — the same argument as for authorization.
+
+Mechanically it is the 2026-07-28 input-needed/resume flow, which replaced the
+elicitation callback: the server returns an `InputRequiredResult` carrying the
+question, the client puts it to a human, and the call is retried with the
+answer and an opaque `request_state` attached.
+
+**The state is client-controlled on the way back in**, so a gate that trusts it
+is decorative — approve a low-urgency incident, retry the same state with
+`urgency: 1`. The first version of this repository hand-rolled an HMAC-signed
+state binding tool, principal, arguments and expiry to close that hole. It was
+then deleted, because the SDK's `RequestStateBoundary` already does it, and
+does it better: AES-256-GCM with a key-rotation ring, binding the method, the
+tool, a digest of the arguments, a salted principal hash, an audience and an
+expiry, fail-closed in both directions. Shipping hand-written cryptography
+beside a reviewed implementation, for no additional property, is not a trade
+worth making. `governance/approval.py` is now thin, and the tests assert
+against the real control rather than a local re-implementation of it.
+
+What is still trusted is the client, which relays the human's decision. Nothing
+in the protocol lets a server verify a human was really asked. The gate raises
+the bar from "an agent can act unilaterally" to "the client must lie about
+consent" — a real improvement, and not the same as proof. A control needing the
+stronger property belongs in ServiceNow's own approval workflow.
+
+### ServiceNow
+
+Two backends behind one interface. `mock` is the default: an in-process store
+answering the same calls with the same shapes, so the repository and its tests
+run with no instance and no credentials. `live` addresses a real instance over
+the Table API, with credentials read from `SERVICENOW_INSTANCE`,
+`SERVICENOW_USER` and `SERVICENOW_PASSWORD` — a Personal Developer Instance is
+enough to exercise it.
+
+```bash
+python server.py --auth dev --servicenow live
+```
+
+The mock is not only a convenience. A connector that runs in-process is one
+whose failure modes can be tested — an expired credential, a configuration item
+that does not resolve — and those are exactly the paths that never get
+exercised against a live instance, because provoking them there is awkward.
+
+Incident records are projected onto a narrow model rather than passed through.
+A ServiceNow incident carries well over a hundred columns, many of them free
+text; forwarding all of it to a language model is how data reaches somewhere it
+was never classified for.
+
 ### Against a real tenant
 
 ```bash
@@ -326,14 +408,12 @@ rather than by implementation order.
    circuit breaker, data classification — with tools generated from manifests
    rather than hand-decorated. Record/replay mock mode so the repository runs
    with no credentials.
-3. **ServiceNow domain and a lighthouse use case.** Table API connector
-   (incident search, create, state update, CMDB lookup) against a free
-   Personal Developer Instance. Then one end-to-end flow: shipment delay →
-   correlate to configuration item → enrich or open an incident, with the
-   human approval gate built on the `2026-07-28` input-needed/resume pattern.
-   That pattern replaces the old elicitation callback: rather than the server
-   calling back to the client mid-request, it returns an "input needed" result
-   with a token and the client calls the tool again with the answer attached.
+3. ~~**ServiceNow domain and a lighthouse use case.**~~ **Done** — see
+   [The lighthouse use case](#the-lighthouse-use-case). Table API connector,
+   the delay-to-incident flow, and a declarative human approval gate on the
+   `2026-07-28` input-needed/resume pattern.
+   Still outstanding here: incident state transitions and work-note enrichment,
+   and a run against a live Personal Developer Instance.
 4. **Audit and observability.** OpenTelemetry tracing is on by default in this
    SDK and no-op until an exporter is attached; attach one. Spans carrying
    principal, tool, connector, classification, policy decision, latency and

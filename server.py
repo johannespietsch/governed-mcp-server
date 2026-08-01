@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
@@ -32,10 +32,12 @@ from pydantic import BaseModel, Field
 
 from governance import (
     audit,
+    servicenow,
     EntraTokenVerifier,
     JwksEndpoint,
     Policy,
     PolicyEnforcementMiddleware,
+    PolicyError,
     StaticJwks,
     entra_issuer,
     entra_jwks_uri,
@@ -105,6 +107,10 @@ def _fixtures() -> dict[str, Shipment]:
 
 SHIPMENTS = _fixtures()
 
+# The ServiceNow backend in use. Rebound by `create_server`; the mock default
+# means importing this module never reaches for a credential.
+SERVICENOW: servicenow.ServiceNow = servicenow.MockServiceNow()
+
 
 def get_shipment_status(shipment_id: str) -> ShipmentStatus:
     """Look up the current status and estimated arrival of a single shipment."""
@@ -136,6 +142,135 @@ def list_delayed_shipments(threshold_hours: int = 24) -> list[DelayedShipment]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# ServiceNow domain — the ITSM side of the lighthouse use case
+# ---------------------------------------------------------------------------
+
+
+class IncidentSummary(BaseModel):
+    number: str
+    short_description: str
+    state: str
+    urgency: str
+    configuration_item: str
+    opened_at: str
+
+
+class DelayAssessment(BaseModel):
+    """The read-only half of the Transport and Logistics Operations flow."""
+
+    shipment_id: str
+    delayed: bool
+    hours_late: float
+    configuration_item: str
+    configuration_item_found: bool
+    open_incidents: list[IncidentSummary]
+    recommendation: str
+
+
+def _summarise(incident: servicenow.Incident) -> IncidentSummary:
+    return IncidentSummary(
+        number=incident.number,
+        short_description=incident.short_description,
+        state=incident.state,
+        urgency=incident.urgency,
+        configuration_item=incident.configuration_item,
+        opened_at=incident.opened_at,
+    )
+
+
+async def search_incidents(configuration_item: str = "", limit: int = 10) -> list[IncidentSummary]:
+    """Search open ServiceNow incidents, optionally for one configuration item."""
+    found = await SERVICENOW.search_incidents(
+        configuration_item=configuration_item or None, limit=limit
+    )
+    return [_summarise(incident) for incident in found]
+
+
+async def get_configuration_item(name: str) -> dict:
+    """Look up a configuration item in the CMDB by name."""
+    item = await SERVICENOW.find_configuration_item(name)
+    if item is None:
+        return {"found": False, "name": name}
+    return {
+        "found": True,
+        "name": item.name,
+        "class": item.ci_class,
+        "operational_status": item.operational_status,
+    }
+
+
+async def assess_shipment_delay(shipment_id: str) -> DelayAssessment:
+    """Correlate a delayed shipment to its handling system and any open incidents.
+
+    The lighthouse flow, read-only half: establish whether a shipment is late,
+    which configuration item handles it, and whether ITSM already knows. Acting
+    on the finding is a separate, separately-authorized tool — an assessment
+    that quietly opened tickets would be unusable in an agent loop, because the
+    agent would have no way to look without also touching production.
+    """
+    shipment = SHIPMENTS.get(shipment_id)
+    if shipment is None:
+        raise ValueError(f"unknown shipment: {shipment_id}")
+
+    hours_late = max(0.0, (shipment.eta - datetime.now(timezone.utc)).total_seconds() / 3600 - 24)
+    delayed = shipment.status == "delayed"
+    item = await SERVICENOW.find_configuration_item(shipment.ci)
+    open_incidents = await SERVICENOW.search_incidents(configuration_item=shipment.ci)
+
+    if not delayed:
+        recommendation = "No action: shipment is not flagged as delayed."
+    elif item is None:
+        recommendation = (
+            f"Escalate manually: {shipment.ci} is not in the CMDB, so an incident "
+            "raised against it would not route."
+        )
+    elif open_incidents:
+        recommendation = (
+            f"Enrich {open_incidents[0].number} rather than opening a duplicate — "
+            f"{shipment.ci} already has an open incident."
+        )
+    else:
+        recommendation = f"Raise a new incident against {shipment.ci}."
+
+    return DelayAssessment(
+        shipment_id=shipment.id,
+        delayed=delayed,
+        hours_late=round(hours_late, 1),
+        configuration_item=shipment.ci,
+        configuration_item_found=item is not None,
+        open_incidents=[_summarise(i) for i in open_incidents],
+        recommendation=recommendation,
+    )
+
+
+async def raise_shipment_incident(shipment_id: str, urgency: str = "3") -> IncidentSummary:
+    """Open a ServiceNow incident for a delayed shipment.
+
+    The write half of the flow. It carries no approval logic of its own — the
+    policy marks it `requires_approval` and the middleware holds the call until
+    a human agrees. Keeping the gate out of the tool is deliberate: a gate a
+    tool author has to remember is a gate that will eventually be forgotten.
+    """
+    shipment = SHIPMENTS.get(shipment_id)
+    if shipment is None:
+        raise ValueError(f"unknown shipment: {shipment_id}")
+    if urgency not in ("1", "2", "3"):
+        raise ValueError("urgency must be '1' (high), '2' (medium) or '3' (low)")
+
+    incident = await SERVICENOW.create_incident(
+        short_description=f"Shipment {shipment.id} delayed to {shipment.destination}",
+        configuration_item=shipment.ci,
+        urgency=urgency,  # type: ignore[arg-type]
+        description=(
+            f"Shipment {shipment.id} from {shipment.origin} to {shipment.destination} "
+            f"is flagged {shipment.status} with an estimated arrival of "
+            f"{shipment.eta:%Y-%m-%d %H:%M} UTC. Raised from the MCP layer."
+        ),
+    )
+    return _summarise(incident)
+
+
 def shipment_detail(shipment_id: str) -> str:
     """Human-readable summary of a shipment, addressable as a resource."""
     shipment = SHIPMENTS.get(shipment_id)
@@ -155,6 +290,7 @@ def create_server(
     resource_url: str = DEFAULT_RESOURCE_URL,
     audience: str = DEFAULT_AUDIENCE,
     enforce: bool = True,
+    servicenow_backend: Literal["mock", "live"] = "mock",
 ) -> MCPServer:
     """Build the server with a given authorization posture.
 
@@ -207,8 +343,15 @@ def create_server(
         auth=auth_settings,
     )
 
+    global SERVICENOW
+    SERVICENOW = servicenow.build(servicenow_backend)
+
     server.tool()(get_shipment_status)
     server.tool()(list_delayed_shipments)
+    server.tool()(search_incidents)
+    server.tool()(get_configuration_item)
+    server.tool()(assess_shipment_delay)
+    server.tool()(raise_shipment_incident)
     server.resource("shipment://{shipment_id}")(shipment_detail)
 
     if auth_mode != "off" and policy_path is not None:
@@ -225,9 +368,21 @@ def create_server(
     return server
 
 
-# Module-level instance for the unauthenticated transport demo, and for
-# `client.py` running in-memory. The governed path is `--auth dev`.
-mcp = create_server(auth_mode="off")
+def __getattr__(name: str) -> Any:
+    """Build the module-level `mcp` on first access rather than at import.
+
+    `client.py` does `from server import mcp` for the unauthenticated in-memory
+    demo, but constructing a server as an import side effect means importing
+    anything from this module builds a connector and emits its log line — which
+    reads as nonsense when the operator asked for a different backend and the
+    next line is a startup failure. Deferring it keeps `import server` free of
+    side effects. The governed path is `--auth dev`.
+    """
+    if name == "mcp":
+        instance = create_server(auth_mode="off")
+        globals()["mcp"] = instance
+        return instance
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":
@@ -250,6 +405,12 @@ if __name__ == "__main__":
         action="store_true",
         help="audit policy decisions without enforcing them, to trial a policy against real traffic",
     )
+    parser.add_argument(
+        "--servicenow",
+        choices=["mock", "live"],
+        default="mock",
+        help="ServiceNow backend (default: mock, requires no credentials)",
+    )
     parser.add_argument("--print-token", metavar="ROLE", nargs="*",
                         help="with --auth dev, print a token carrying these roles and exit")
     args = parser.parse_args()
@@ -271,12 +432,19 @@ if __name__ == "__main__":
         print(idp.issue(roles=list(args.print_token)))
         raise SystemExit(0)
 
-    app = create_server(
-        auth_mode=args.auth,
-        dev_idp=idp,
-        resource_url=f"http://{args.host}:{args.port}/mcp",
-        enforce=not args.shadow,
-    )
+    try:
+        app = create_server(
+            auth_mode=args.auth,
+            dev_idp=idp,
+            resource_url=f"http://{args.host}:{args.port}/mcp",
+            enforce=not args.shadow,
+            servicenow_backend=args.servicenow,
+        )
+    except (servicenow.ServiceNowError, PolicyError) as exc:
+        # Misconfiguration, not a crash: a missing credential or a policy that
+        # does not load should read as an operator error on one line, not as a
+        # traceback that looks like a defect in the server.
+        raise SystemExit(f"startup failed: {exc}") from None
 
     # streamable_http_app() is the ASGI (Asynchronous Server Gateway Interface)
     # app — this is what sits behind Azure API Management, nginx or any ordinary
