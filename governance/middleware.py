@@ -23,9 +23,14 @@ from typing import Any
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.shared.exceptions import MCPError
-from mcp_types import ListToolsResult
+from mcp_types import (
+    ElicitRequest,
+    ElicitRequestFormParams,
+    InputRequiredResult,
+    ListToolsResult,
+)
 
-from . import audit
+from . import approval, audit
 from .policy import Decision, Policy
 from .verifier import describe_principal, roles_from_token
 
@@ -66,18 +71,110 @@ class PolicyEnforcementMiddleware:
         params = _params(ctx)
         tool = str(params.get("name", ""))
         arguments = params.get("arguments")
+        principal = self._principal()
         roles = self._roles()
 
         decision = self.policy.decide_tool(tool, roles)
         audit.record(
-            principal=self._principal(),
+            principal=principal,
             method="tools/call",
             decision=decision,
             arguments=arguments if isinstance(arguments, Mapping) else None,
             protocol_version=getattr(ctx, "protocol_version", None),
         )
         self._raise_if_denied(decision)
+
+        if decision.requires_approval and self.enforce:
+            gate = self._check_approval(params, tool=tool, principal=principal, arguments=arguments)
+            if gate is not None:
+                return gate
+
         return await call_next(ctx)
+
+    def _check_approval(
+        self,
+        params: Mapping[str, Any],
+        *,
+        tool: str,
+        principal: str,
+        arguments: Any,
+    ) -> InputRequiredResult | None:
+        """Return an `InputRequiredResult` to pause the call, or None to proceed.
+
+        First round: no answers yet, so ask. Later rounds: the state has already
+        been unsealed and re-bound to this exact call by the SDK's
+        `RequestStateBoundary`, so what is left is to confirm the state is one
+        this layer issued and that the human said yes. See
+        governance/approval.py for the division of labour.
+        """
+        answers = params.get("inputResponses") or params.get("input_responses")
+        state = params.get("requestState") or params.get("request_state")
+        args = arguments if isinstance(arguments, Mapping) else {}
+
+        if not answers:
+            return self._ask_for_approval(tool=tool, principal=principal, arguments=args)
+
+        try:
+            approval.check(state, answers, tool=tool)
+        except approval.ApprovalError as exc:
+            # Every failure here is a denial. The distinction — no approval
+            # requested, unanswered, declined — matters to whoever reads the
+            # audit log, not to the caller.
+            self._audit_approval(tool, principal, "deny", str(exc))
+            raise MCPError(
+                AUTHORIZATION_DENIED,
+                f"{tool!r} was not approved: {exc}.",
+                {"target": tool},
+            ) from exc
+
+        self._audit_approval(tool, principal, "allow", "approved by human")
+        return None
+
+    def _ask_for_approval(
+        self, *, tool: str, principal: str, arguments: Mapping[str, Any]
+    ) -> InputRequiredResult:
+        rule = self.policy.tools.get(tool)
+        prompt = (rule.approval_prompt if rule else "") or f"Approve running {tool}?"
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(arguments.items())) or "no arguments"
+        self._audit_approval(tool, principal, "pending", "awaiting human approval")
+
+        return InputRequiredResult(
+            input_requests={
+                approval.APPROVAL_KEY: ElicitRequest(
+                    params=ElicitRequestFormParams(
+                        message=f"{prompt}\n\n{tool}({detail})",
+                        requested_schema={
+                            "type": "object",
+                            "properties": {
+                                "approve": {
+                                    "type": "boolean",
+                                    "title": "Approve",
+                                    "description": f"Allow {tool} to run with these arguments.",
+                                }
+                            },
+                            "required": ["approve"],
+                        },
+                    )
+                )
+            },
+            # Sealed on the way out by the SDK's RequestStateBoundary, which
+            # binds it to this tool, these arguments and this principal.
+            request_state=approval.new_pending_state(tool),
+        )
+
+    def _audit_approval(self, tool: str, principal: str, outcome: str, reason: str) -> None:
+        audit.record(
+            principal=principal,
+            method="approval",
+            outcome=outcome,
+            decision=Decision(
+                allowed=outcome == "allow",
+                reason=reason,
+                target=tool,
+                classification=(self.policy.tools[tool].classification
+                                if tool in self.policy.tools else None),
+            ),
+        )
 
     async def _guard_resource_read(self, ctx: Any, call_next: Any) -> Any:
         params = _params(ctx)
