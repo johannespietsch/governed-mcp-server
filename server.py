@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 
 from governance import (
     audit,
+    request_state,
     servicenow,
     EntraTokenVerifier,
     JwksEndpoint,
@@ -341,6 +342,11 @@ def create_server(
         "Governed MCP Server",
         token_verifier=verifier,
         auth=auth_settings,
+        # Shared across replicas, so an approval issued by one instance can be
+        # verified by any other. Without this the SDK defaults to a per-process
+        # key and the approval flow quietly requires session affinity — see
+        # governance/request_state.py.
+        request_state_security=request_state.build(),
     )
 
     global SERVICENOW
@@ -413,7 +419,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--print-token", metavar="ROLE", nargs="*",
                         help="with --auth dev, print a token carrying these roles and exit")
+    parser.add_argument("--print-state-key", action="store_true",
+                        help=f"print a fresh key for {request_state.ENV_KEYS} and exit")
     args = parser.parse_args()
+
+    if args.print_state_key:
+        print(request_state.generate_key())
+        raise SystemExit(0)
 
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
     audit.configure()
@@ -440,7 +452,7 @@ if __name__ == "__main__":
             enforce=not args.shadow,
             servicenow_backend=args.servicenow,
         )
-    except (servicenow.ServiceNowError, PolicyError) as exc:
+    except (servicenow.ServiceNowError, PolicyError, request_state.RequestStateKeyError) as exc:
         # Misconfiguration, not a crash: a missing credential or a policy that
         # does not load should read as an operator error on one line, not as a
         # traceback that looks like a defect in the server.

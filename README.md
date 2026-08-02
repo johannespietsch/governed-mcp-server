@@ -11,10 +11,11 @@ it — who may call which tool, against which system, with what recorded
 afterwards. This repository builds that out in tranches, on top of a stateless
 `2026-07-28` server.
 
-**Status: tranches 1 and 3 implemented and tested** — identity and
-authorization, and the ServiceNow domain with its lighthouse use case. 46 tests,
-in-memory and over real HTTP. Tranches 2, 4, 5 and 6 under [Roadmap](#roadmap)
-are designed but not yet implemented, and are marked as such.
+**Status: tranches 1, 3 and 6 implemented** — identity and authorization, the
+ServiceNow domain with its lighthouse use case, and the operational
+documentation in [`docs/`](docs/). 55 tests, in-memory and over real HTTP.
+Tranches 2, 4 and 5 under [Roadmap](#roadmap) are designed but not yet
+implemented, and are marked as such.
 
 Nothing here has been deployed against a live Azure tenant, and the ServiceNow
 connector runs against an in-process mock by default — so the repository has no
@@ -79,6 +80,7 @@ python -m pytest -q
   - `policy.py` — the policy document and the decisions it yields
   - `middleware.py` — enforcement, applied uniformly to every request
   - `approval.py` — the human-in-the-loop gate
+  - `request_state.py` — the signing key ring shared across replicas
   - `audit.py` — the authorization decision trail
   - `servicenow.py` — the ITSM connector, live or mocked
   - `devidp.py` — a local identity provider, so all of the above is testable
@@ -310,6 +312,22 @@ A ServiceNow incident carries well over a hundred columns, many of them free
 text; forwarding all of it to a language model is how data reaches somewhere it
 was never classified for.
 
+### Running more than one replica
+
+The approval flow spans two round trips, so the state sealing it must be
+verifiable by whichever replica answers the retry. The SDK defaults to a
+process-local key, which would quietly reintroduce the session affinity this
+whole design exists to avoid. Give every replica the same key:
+
+```bash
+export MCP_REQUEST_STATE_KEYS=$(python server.py --print-state-key)
+```
+
+It is a rotation ring — the first key seals, every key unseals — so rotation is
+three deployments with no dropped approvals. See
+[the runbook](docs/runbooks/rotate-request-state-key.md). Unset, the server
+still runs and warns that it is single-replica only.
+
 ### Against a real tenant
 
 ```bash
@@ -425,11 +443,13 @@ rather than by implementation order.
    registrations, Key Vault, Log Analytics and private endpoints. The API
    Management policy — token validation, per-subject rate limiting, logging —
    matters more here than the compute configuration.
-6. **Operational documentation.** Architecture decision records, a security
-   baseline with data classification tiers and a STRIDE threat model covering
-   MCP-specific threats (tool poisoning, rug-pull, injection via tool results,
-   confused deputy), runbooks for secret rotation and connector revocation,
-   and a guide for onboarding the second domain.
+6. ~~**Operational documentation.**~~ **Done** — see [`docs/`](docs/). A
+   [security baseline](docs/security-baseline.md) with classification tiers, a
+   STRIDE threat model and the MCP-specific threats outside it; runbooks for
+   [key rotation](docs/runbooks/rotate-request-state-key.md) and
+   [revoking access](docs/runbooks/revoke-access.md); four
+   [architecture decision records](docs/adr/); and a
+   [guide to onboarding the next domain](docs/onboarding-a-domain.md).
 
 ## License
 
