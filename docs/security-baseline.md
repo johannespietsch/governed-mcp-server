@@ -110,6 +110,8 @@ Rated by residual risk *after* the mitigation described.
 | Unauthenticated request flood | Intended to sit behind API Management with rate limiting per subject. | **Open** until tranche 5. |
 | Slow or hung identity provider stalls the server | JWKS fetch runs off the event loop, so one slow request does not block every concurrent request. | Low |
 | Approval loop driven indefinitely | The SDK caps retry rounds (default 10) and request state expires after 600 seconds. | Low |
+| A hung downstream call holds a request open indefinitely | Per-tier deadlines cancel the call and report it as a failure ([service levels](sla-framework.md)). | Low — but **off for `incident-raising`**, deliberately: cancelling a write mid-flight can leave the incident created and the caller told it failed. |
+| Degradation that never surfaces because nothing measures it | Availability and latency recorded per call, with authorization denials excluded so a policy tightening does not read as an outage. | **Medium — open.** The sink is a log file, so a breach is visible in a report run afterwards and not in an alert. Tranche 4. |
 
 ### Elevation of privilege
 

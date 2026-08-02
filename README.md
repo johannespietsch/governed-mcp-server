@@ -11,11 +11,11 @@ it — who may call which tool, against which system, with what recorded
 afterwards. This repository builds that out in tranches, on top of a stateless
 `2026-07-28` server.
 
-**Status: tranches 1, 3 and 6 implemented** — identity and authorization, the
-ServiceNow domain with its lighthouse use case, and the operational
-documentation in [`docs/`](docs/). 55 tests, in-memory and over real HTTP.
-Tranches 2, 4 and 5 under [Roadmap](#roadmap) are designed but not yet
-implemented, and are marked as such.
+**Status: tranches 1, 3, 6 and 7 implemented** — identity and authorization, the
+ServiceNow domain with its lighthouse use case, the operational documentation in
+[`docs/`](docs/), and the service level framework. 89 tests, in-memory and over
+real HTTP. Tranches 2, 4 and 5 under [Roadmap](#roadmap) are designed but not
+yet implemented, and are marked as such.
 
 Nothing here has been deployed against a live Azure tenant, and the ServiceNow
 connector runs against an in-process mock by default — so the repository has no
@@ -74,6 +74,8 @@ python -m pytest -q
   authorization posture.
 - **`policy.yaml`** — who may call what, and what needs a human. The whole
   access-control model, as a reviewable document.
+- **`sla.yaml`** — what has been promised about it, and the service map. Tiers,
+  error budgets, and the dependencies that cap them.
 - **`governance/`** — the layers wrapped around the server:
   - `verifier.py` — Entra ID token validation, implementing the SDK's
     `TokenVerifier` protocol
@@ -82,6 +84,8 @@ python -m pytest -q
   - `approval.py` — the human-in-the-loop gate
   - `request_state.py` — the signing key ring shared across replicas
   - `audit.py` — the authorization decision trail
+  - `sla.py` — the service level document, and attainment computed from records
+  - `sli.py` — measurement, and the deadline that bounds a latency objective
   - `servicenow.py` — the ITSM connector, live or mocked
   - `devidp.py` — a local identity provider, so all of the above is testable
     with no Azure tenant
@@ -341,6 +345,96 @@ users or service principals. Signing keys are fetched from the tenant's JWKS
 endpoint and cached by key id, so key rollover needs no restart. This path is
 implemented but has not been run against a live tenant.
 
+## Service levels
+
+`policy.yaml` says who may call what. [`sla.yaml`](sla.yaml) says what has been
+promised about it — as a second declarative document, validated at startup, with
+measurement in middleware and attainment computed from what it records. The
+model is in [`docs/sla-framework.md`](docs/sla-framework.md).
+
+| Service | Tier | Availability | p95 | Depends on |
+| --- | --- | --- | --- | --- |
+| `transport-visibility` | gold | 99.9% | 500 ms | — |
+| `delay-assessment` | silver | 98.5% | 2 s | ServiceNow |
+| `incident-raising` | silver | 98.5% | 2 s | ServiceNow |
+
+A tier is a bundle of objectives taken on wholesale, so onboarding a domain in
+Phase 2 means picking one rather than negotiating numbers. `sla.yaml` also
+carries the service map — owner, business service, and the CMDB configuration
+items each service runs on — because a service map that disagrees with the SLA
+document is worse than either alone.
+
+### The arithmetic the loader enforces
+
+Availability composes multiplicatively across everything in the request path, so
+a service reaching one 99% system cannot itself be better than 99%. The loader
+computes that ceiling and **refuses to start if a tier promises more than the
+dependencies allow**:
+
+```
+startup failed: sla.yaml: service 'delay-assessment' is tier 'gold' (99.9000%),
+but its dependencies (entra, servicenow) cap it at 98.9901%. Lower the tier,
+remove the dependency from the request path, or renegotiate the dependency.
+```
+
+The ITSM services are silver for that reason — arithmetic, not modesty. This is
+the check that usually gets skipped, and skipping it produces a commitment that
+was impossible on the day it was signed and is discovered a quarter later.
+
+### What counts as a failure
+
+The denominator is the part that gets fudged, so it is in code and tested. Tool
+errors and calls cancelled at the deadline spend the error budget. Three things
+are excluded: **authorization denials**, because a denial is the control working
+and counting it as an outage ends with someone loosening the policy to protect a
+dashboard; **pauses for human approval**, because waiting on a person is not the
+service being slow; and tools no service has claimed. Exclusions are counted and
+reported, never silently dropped.
+
+Measurement is registered *outside* policy enforcement so it observes the calls
+policy refuses. Measuring inside the gate would exclude denials by never seeing
+them — the same clean number, with no record that anyone was turned away.
+
+### Deadlines
+
+Each tier carries a deadline, and the middleware cancels a call that exceeds it.
+An objective with nothing enforcing it is a wish: a call that hangs never
+breaches a latency objective, it just never appears in the numbers. Enforcement
+is per service and **off for `incident-raising`** — cancelling a write mid-flight
+can leave the incident created and the caller told it failed, and a duplicate
+incident is worse than a slow one. `--no-deadlines` measures without cancelling,
+which is the posture to run first.
+
+### Try it
+
+```bash
+python server.py --auth dev --sla-log sla.jsonl &
+# ... traffic ...
+python server.py --sla-report sla.jsonl
+```
+
+```
+service               tier       events     avail   target   budget   latency   target  status
+delay-assessment      silver          1  100.000%  98.500%       0%     0.1ms   2000ms  too few events (need 67)
+incident-raising      silver          0        --  98.500%       --        --   2000ms  no data
+transport-visibility  gold           10   90.000%  99.900%    >999%     1.2ms    500ms  too few events (need 1000)
+
+1 event(s) excluded from these figures — authorization denials, approval pauses
+and unmapped tools.
+```
+
+That output is from the demo above, and it is showing the right thing: **a
+99.9% objective permits one failure per thousand requests, so ten requests
+cannot evaluate it.** A framework that cried breach on ten events would teach
+everyone to ignore it before it had enough data to be right. Objectives are
+applied at report time rather than baked into the records, so a proposed tier
+can also be replayed against history.
+
+The sink is a log file, so there is no alerting and no burn-rate window — that
+arrives with tranche 4, at which point these records become metrics and nothing
+about the model changes. What happens when a budget is spent is the
+[runbook](docs/runbooks/error-budget-exhausted.md).
+
 ## Old clients
 
 The claim that one endpoint serves both eras is worth verifying rather than
@@ -439,6 +533,9 @@ rather than by implementation order.
    classification. Audit and telemetry are different deliverables with
    different retention and access rules, and collapsing them into one stream
    is a mistake. Dashboards and alert rules committed as artefacts.
+   The service levels from tranche 7 are what those dashboards should show:
+   the indicators are already emitted per call, and what is missing is the
+   exporter, the burn-rate windows and the alert rules on top of them.
 5. **Deployment.** Bicep for Container Apps, API Management, Entra app
    registrations, Key Vault, Log Analytics and private endpoints. The API
    Management policy — token validation, per-subject rate limiting, logging —
@@ -447,9 +544,19 @@ rather than by implementation order.
    [security baseline](docs/security-baseline.md) with classification tiers, a
    STRIDE threat model and the MCP-specific threats outside it; runbooks for
    [key rotation](docs/runbooks/rotate-request-state-key.md) and
-   [revoking access](docs/runbooks/revoke-access.md); four
+   [revoking access](docs/runbooks/revoke-access.md);
    [architecture decision records](docs/adr/); and a
    [guide to onboarding the next domain](docs/onboarding-a-domain.md).
+7. ~~**Service levels.**~~ **Done** — see [Service levels](#service-levels) and
+   [the framework](docs/sla-framework.md). Tiers, error budgets and the service
+   map as a declarative document; the dependency ceiling enforced at startup;
+   per-call measurement with denials and approval pauses explicitly excluded;
+   tier deadlines; and an attainment report.
+   Still outstanding here: the records land in a log file rather than a time
+   series, so there are no alerts and no burn-rate windows — that is tranche 4.
+   The support response targets are declared but not measured, and the
+   ServiceNow availability they all hang off is an assumption rather than a
+   contracted number.
 
 ## License
 

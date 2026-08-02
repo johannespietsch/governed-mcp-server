@@ -10,8 +10,13 @@ venv/
 .claude/
 .DS_Store
 
-# Client material — never publish.
+# Client material — never publish. The annotated copy quotes the JD verbatim,
+# so it carries the same restriction as the original.
 JD.md
+JD-annotated.md
+
+# Service level records written by --sla-log. Local measurement, not source.
+*.jsonl
 
 # Development identity provider signing key (--auth dev). Local only.
 .devidp-key.pem
