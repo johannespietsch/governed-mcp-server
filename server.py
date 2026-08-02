@@ -34,11 +34,16 @@ from governance import (
     audit,
     request_state,
     servicenow,
+    sla as sla_module,
+    sli,
     EntraTokenVerifier,
     JwksEndpoint,
     Policy,
     PolicyEnforcementMiddleware,
     PolicyError,
+    ServiceLevelMiddleware,
+    Sla,
+    SlaError,
     StaticJwks,
     entra_issuer,
     entra_jwks_uri,
@@ -292,6 +297,8 @@ def create_server(
     audience: str = DEFAULT_AUDIENCE,
     enforce: bool = True,
     servicenow_backend: Literal["mock", "live"] = "mock",
+    sla_path: str | None = "sla.yaml",
+    enforce_deadlines: bool = True,
 ) -> MCPServer:
     """Build the server with a given authorization posture.
 
@@ -306,6 +313,10 @@ def create_server(
     `dev` and `entra` differ only in where signing keys are fetched from. The
     verifier, the policy and the enforcement path are identical, so the tests
     that run against `dev` are exercising the code that runs in production.
+
+    `sla_path` is independent of all of that. What a service has promised does
+    not depend on how its callers authenticate, so measurement is registered in
+    every mode — including `off`, where there is no policy at all.
     """
     verifier = None
     auth_settings = None
@@ -360,16 +371,31 @@ def create_server(
     server.tool()(raise_shipment_incident)
     server.resource("shipment://{shipment_id}")(shipment_detail)
 
+    # `Server.middleware` is the documented context-tier extension point: it
+    # wraps every inbound request before validation or dispatch, which is what
+    # lets these be applied uniformly instead of per tool. The list is composed
+    # outermost-first, so the order of these two appends is the order they
+    # nest — and appending both leaves them inside the SDK's OpenTelemetry
+    # middleware, which therefore still traces the requests they reject.
+    middleware = server._lowlevel_server.middleware  # noqa: SLF001 - no public accessor yet
+
+    sla = Sla.load(sla_path) if sla_path is not None else None
+    if sla is not None:
+        # Registered first, so measurement sits *outside* enforcement and
+        # observes the calls policy refuses. Measuring inside the gate would
+        # exclude denials by never seeing them, which reads identically in the
+        # numbers while hiding how often callers are being turned away.
+        middleware.append(ServiceLevelMiddleware(sla, enforce_deadlines=enforce_deadlines))
+
     if auth_mode != "off" and policy_path is not None:
         policy = Policy.load(policy_path)
-        # `Server.middleware` is the documented context-tier extension point:
-        # it wraps every inbound request before validation or dispatch, which
-        # is what lets authorization be applied uniformly instead of per tool.
-        # Appending puts it innermost, so the SDK's OpenTelemetry middleware
-        # still traces the requests this one rejects.
-        server._lowlevel_server.middleware.append(  # noqa: SLF001 - no public accessor yet
-            PolicyEnforcementMiddleware(policy, enforce=enforce)
-        )
+        if sla is not None:
+            # Every tool with an authorization decision must also have a service
+            # level. Checked here rather than only in a test, because the two
+            # documents are edited by different people for different reasons and
+            # drift between them is the expected failure.
+            sla.check_coverage(policy.tools)
+        middleware.append(PolicyEnforcementMiddleware(policy, enforce=enforce))
 
     return server
 
@@ -417,6 +443,21 @@ if __name__ == "__main__":
         default="mock",
         help="ServiceNow backend (default: mock, requires no credentials)",
     )
+    parser.add_argument(
+        "--sla-log",
+        metavar="PATH",
+        help="write service level records to PATH instead of stdout, so they can be reported on",
+    )
+    parser.add_argument(
+        "--no-deadlines",
+        action="store_true",
+        help="measure service levels without cancelling calls that exceed the tier deadline",
+    )
+    parser.add_argument(
+        "--sla-report",
+        metavar="PATH",
+        help="print attainment and error budget from a service level record file ('-' for stdin) and exit",
+    )
     parser.add_argument("--print-token", metavar="ROLE", nargs="*",
                         help="with --auth dev, print a token carrying these roles and exit")
     parser.add_argument("--print-state-key", action="store_true",
@@ -427,8 +468,21 @@ if __name__ == "__main__":
         print(request_state.generate_key())
         raise SystemExit(0)
 
+    if args.sla_report:
+        try:
+            document = Sla.load("sla.yaml")
+        except SlaError as exc:
+            raise SystemExit(f"service level document failed to load: {exc}") from None
+        samples = sla_module.load_samples(args.sla_report)
+        print(sla_module.format_report(sla_module.report(samples, document)))
+        raise SystemExit(0)
+
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
     audit.configure()
+    # Records go to a file when one is named, because the point of the stream is
+    # to be read back by --sla-report, and interleaving it with application
+    # logging on stdout makes that a text-processing exercise.
+    sli.configure(open(args.sla_log, "a", buffering=1) if args.sla_log else None)
 
     # Persisted so that `--print-token` in a second terminal signs with the same
     # key the running server verifies against.
@@ -451,8 +505,10 @@ if __name__ == "__main__":
             resource_url=f"http://{args.host}:{args.port}/mcp",
             enforce=not args.shadow,
             servicenow_backend=args.servicenow,
+            enforce_deadlines=not args.no_deadlines,
         )
-    except (servicenow.ServiceNowError, PolicyError, request_state.RequestStateKeyError) as exc:
+    except (servicenow.ServiceNowError, PolicyError, SlaError,
+            request_state.RequestStateKeyError) as exc:
         # Misconfiguration, not a crash: a missing credential or a policy that
         # does not load should read as an operator error on one line, not as a
         # traceback that looks like a defect in the server.

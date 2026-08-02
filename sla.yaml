@@ -1,0 +1,204 @@
+# Service level document for the MCP layer.
+#
+# This file is to service levels what policy.yaml is to authorization: the
+# single place where the commitment is written down, as data rather than code,
+# so it can be reviewed by whoever signs it and diffed when it changes.
+#
+# Three things live here, and the distinction matters:
+#
+#   tiers         the reusable promises. A tier is a bundle of objectives that
+#                 a service takes on wholesale. Phase 2 onboards a domain by
+#                 picking a tier, not by inventing numbers.
+#   services      the service map. Which tools make up a service, who owns it,
+#                 which configuration items it runs on, and what it depends on.
+#   dependencies  what we rely on and how good it is. A service cannot promise
+#                 more availability than its dependencies leave it, and the
+#                 loader refuses to start if one tries to.
+#
+# What is measured from this: availability and latency, as request-based SLIs,
+# from the records governance/sli.py emits. What is declared but *not* measured:
+# the support response targets, which are a human commitment with no signal in
+# this repository. They are marked as such rather than left out, because an SLA
+# framework that only covers what happens to be instrumented is not a framework.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Tiers
+# ---------------------------------------------------------------------------
+#
+# availability_objective  ratio of good to valid requests over the window. Not
+#                         uptime: a stateless replica set behind a load
+#                         balancer is almost never wholly down, and "the
+#                         service was up" is not what a caller experiences.
+#                         See docs/sla-framework.md for what "valid" excludes.
+# latency_objective_ms    the threshold, at latency_percentile. Read as "95% of
+#                         valid requests complete within 500 ms", measured at
+#                         this layer's boundary — the caller's network time is
+#                         not ours to promise.
+# deadline_ms             the point at which a call is cut off and reported as
+#                         a failure rather than left hanging. An objective with
+#                         no deadline behind it is a wish: an unbounded call
+#                         does not breach a latency objective, it just never
+#                         appears in the numbers. Set well above the objective
+#                         so it kills hangs, not slow-but-legitimate calls.
+# window_days             rolling, not calendar. A calendar window resets the
+#                         error budget on the first of the month, which is an
+#                         incentive to spend it on the 30th.
+
+tiers:
+  gold:
+    description: >-
+      Production services with no external dependency in the request path.
+      Suitable for anything an operator or an agent calls in a loop.
+    availability_objective: 0.999
+    latency_objective_ms: 500
+    latency_percentile: 95
+    deadline_ms: 5000
+    window_days: 30
+    # Declared, not measured. Minutes to a human acknowledgement, by the same
+    # urgency scale ServiceNow uses (1 high, 2 medium, 3 low), so a breach here
+    # maps onto the incident it will be raised as.
+    response_targets:
+      "1": 30
+      "2": 240
+      "3": 1440
+
+  silver:
+    description: >-
+      Production services that reach a third-party system in the request path.
+      The ceiling is set by that system, not by this layer — see
+      `dependencies` below and the check the loader performs.
+    availability_objective: 0.985
+    latency_objective_ms: 2000
+    latency_percentile: 95
+    deadline_ms: 20000
+    window_days: 30
+    response_targets:
+      "1": 60
+      "2": 480
+      "3": 2880
+
+  bronze:
+    description: >-
+      Newly onboarded or experimental domains. The tier a domain sits in for
+      its first weeks, so that its real attainment is observed before anything
+      is promised about it. Nothing is expected to page on a bronze breach.
+    availability_objective: 0.95
+    latency_objective_ms: 5000
+    latency_percentile: 90
+    deadline_ms: 30000
+    window_days: 30
+    response_targets:
+      "1": 480
+      "2": 2880
+      "3": 10080
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+#
+# `availability` is what we are willing to rely on, which is not always what
+# the provider publishes and is never better than it. `source` records where
+# the number came from, because an assumption that has been written down as an
+# assumption can be challenged, and one that has been quietly rounded up cannot.
+
+dependencies:
+  entra:
+    description: >-
+      Microsoft Entra ID. In the request path of every governed call: token
+      signature verification uses keys fetched from the tenant's JWKS
+      endpoint. Cached by key id, so a brief outage degrades rather than
+      failing, but a cold replica cannot verify anything.
+    availability: 0.9999
+    source: Microsoft Online Services SLA for Entra ID (99.99%).
+
+  servicenow:
+    description: >-
+      The ServiceNow instance behind the ITSM connector, over the Table API.
+    availability: 0.99
+    timeout_ms: 15000
+    source: >-
+      Assumption, not a commitment. This is developed against a Personal
+      Developer Instance, which carries no SLA at all. 99% is a deliberately
+      conservative placeholder; replace it with the number from the actual
+      subscription before anything downstream of it is signed.
+
+# Dependencies every service inherits, whether or not it names them. Identity
+# is in the path of every governed call, so leaving it out of each service's
+# own list and applying it once is both less repetitive and harder to forget.
+platform:
+  depends_on:
+    - entra
+
+# ---------------------------------------------------------------------------
+# Services — the service map
+# ---------------------------------------------------------------------------
+#
+# A service is the unit a commitment is made about. Tools are grouped into one
+# when they fail together and are called for the same reason; splitting them
+# any finer produces attainment numbers computed over too few events to mean
+# anything, and grouping them coarser hides a broken tool inside a healthy
+# average.
+#
+# `configuration_items` is the join to the CMDB, which is what makes this a
+# service map rather than a list: it is how a breach here becomes an incident
+# against something ServiceNow already knows about.
+
+services:
+  transport-visibility:
+    description: >-
+      Read-only visibility into shipments. No third-party system in the request
+      path, which is the only reason this can be gold.
+    tier: gold
+    owner: TLO platform team
+    business_service: Transport & Logistics Operations
+    configuration_items:
+      - CI-WMS-01
+      - CI-TMS-02
+    depends_on: []
+    # Safe to cut off: these calls are reads with no downstream side effect, so
+    # a caller that is told the call failed has been told the truth.
+    enforce_deadline: true
+    tools:
+      - get_shipment_status
+      - list_delayed_shipments
+
+  delay-assessment:
+    description: >-
+      The read half of the lighthouse use case, plus the ITSM reads it is built
+      on. Reaches ServiceNow, so it is capped by ServiceNow.
+    tier: silver
+    owner: TLO platform team
+    business_service: Transport & Logistics Operations
+    configuration_items:
+      - CI-WMS-01
+      - CI-TMS-02
+    depends_on:
+      - servicenow
+    enforce_deadline: true
+    tools:
+      - search_incidents
+      - get_configuration_item
+      - assess_shipment_delay
+
+  incident-raising:
+    description: >-
+      The write half of the lighthouse use case. Same availability tier as the
+      reads it follows, and deliberately not deadline-enforced.
+    tier: silver
+    owner: TLO platform team
+    business_service: Transport & Logistics Operations
+    configuration_items:
+      - CI-WMS-01
+      - CI-TMS-02
+    depends_on:
+      - servicenow
+    # Off, for two reasons. This tool creates a record in a downstream system,
+    # so a call cut off mid-flight may have taken effect while the caller is
+    # told it failed — a duplicate incident is a worse outcome than a slow one.
+    # And the call is human-gated: measurement wraps enforcement, so a deadline
+    # here would also be counting the round trip that pauses for approval.
+    enforce_deadline: false
+    tools:
+      - raise_shipment_incident

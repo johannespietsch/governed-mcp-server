@@ -13,12 +13,19 @@ covers how it is meant to be operated, reviewed, and extended.
 
 ## For whoever operates it
 
+- **[Service level framework](sla-framework.md)** — SLI, SLO and SLA kept
+  apart; the tier model; what counts as a failure and what is excluded from the
+  denominator; error budgets; and the dependency arithmetic that decides which
+  tier a service is even allowed to claim.
 - **[Rotate the request-state signing key](runbooks/rotate-request-state-key.md)**
   — the three-phase rotation, what breaks if a phase is rolled out partially,
   and what to do differently in an actual compromise.
 - **[Revoke access](runbooks/revoke-access.md)** — the three different things
   that get called this, their blast radii and speeds, and why removing an Entra
   role does not stop someone immediately.
+- **[The error budget is spent](runbooks/error-budget-exhausted.md)** — what
+  happens after a breach, the three honest responses to it, and the one
+  tempting response that makes the whole framework worthless.
 
 ## For whoever extends it
 
@@ -41,10 +48,14 @@ Architecture decision records, newest last:
   · a signed-state implementation that was written, then deleted once the SDK
   was found to already provide it — and the load-balancer defect that
   investigation surfaced.
+- **[0005 — Service levels as a second declarative document](adr/0005-service-levels-as-a-second-document.md)**
+  · why the SLA is YAML the loader validates rather than prose or annotations,
+  and why measurement was worth building before the exporter it eventually
+  feeds.
 
 ## Status
 
-Tranches 1, 3 and 6 of the [roadmap](../README.md#roadmap) are implemented.
+Tranches 1, 3, 6 and 7 of the [roadmap](../README.md#roadmap) are implemented.
 Tranches 2, 4 and 5 — the connector abstraction, observability export, and
 Azure deployment — are designed and marked as such throughout.
 
